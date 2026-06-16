@@ -699,3 +699,22 @@ class DuckHuntGame:
     def _quit(self):
         self.cap.release()
         pygame.quit()
+
+# Entry point(main function)
+if __name__ == "__main__":
+    print("🎮  Duck Hunt — Finger Tracking  v2")
+    print("━" * 45)
+    print("  ☝  Point index finger UP   →  AIM")
+    print("  ↙  Flick finger DOWN       →  SHOOT")
+    print("  R                          →  Restart")
+    print("  Q / ESC                    →  Quit")
+    print("━" * 45)
+    print()
+    print("💡 Tips for best finger tracking:")
+    print("  • Good lighting on your hand")
+    print("  • Hold hand 30–60 cm from the camera")
+    print("  • Extend index finger, curl others (gun shape)")
+    print("  • Point finger UP to aim, flick DOWN to shoot")
+    print("  • Plain/dark sleeve helps with skin detection")
+    print()
+    DuckHuntGame().run()
