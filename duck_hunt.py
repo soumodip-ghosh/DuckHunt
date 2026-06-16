@@ -212,3 +212,172 @@ class FloatText:
         s.set_alpha(int(max(0, self.life / 1.3) * 255))
         surf.blit(s, (int(self.x - s.get_width() / 2), int(self.y)))
 
+# FINGER TRACKER
+# Uses OpenCV to track the player's index fingertip in real-time from webcam feed.
+class FingerTracker:
+    """
+    Tracks your index fingertip using refined contour analysis.
+
+    Pipeline:
+      1. Skin segmentation (HSV + YCrCb)
+      2. Motion foreground detection to isolate hand
+      3. Find hand contour (largest moving object)
+      4. Use convex defects to identify pointing finger tip
+      5. EMA-smooth position across frames
+      6. Detect downward "flick" gesture = shoot
+    """
+
+    def __init__(self):
+        self.tip_screen  = None      # (x, y) in WIN_W × WIN_H coords
+        self.hand_found  = False
+        self._ema_x      = None
+        self._ema_y      = None
+        self._y_history  = collections.deque(maxlen=14)
+        self._shoot_armed = False
+        self.shoot_now   = False
+        self._last_shot  = 0.0
+        # Background subtractor to isolate moving hand (not face)
+        self._bgsub = cv2.createBackgroundSubtractorMOG2(
+            history=200, varThreshold=60, detectShadows=False)
+        self._frame_count = 0
+
+    def _skin_mask(self, frame):
+        """Create skin mask using HSV + YCrCb"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        ycc = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+
+        m1 = cv2.inRange(hsv, SKIN_HSV_LO1, SKIN_HSV_HI1)
+        m2 = cv2.inRange(hsv, SKIN_HSV_LO2, SKIN_HSV_HI2)
+        m3 = cv2.inRange(ycc, SKIN_YCC_LO,  SKIN_YCC_HI)
+
+        mask = cv2.bitwise_or(m1, m2)
+        mask = cv2.bitwise_and(mask, m3)
+        return mask
+
+    def _find_fingertip(self, hand_contour, frame_h, frame_w):
+        """
+        Find the topmost pointed finger using convex hull defects.
+        Returns (x, y) or None if no clear fingertip found.
+        """
+        if len(hand_contour) < 5:
+            return None
+
+        hull = cv2.convexHull(hand_contour, returnPoints=False)
+        if len(hull) < 3:
+            return None
+
+        # Get defects (valleys between fingers)
+        defects = cv2.convexityDefects(hand_contour, hull)
+        if defects is None or len(defects) < 2:
+            return None
+
+        # Find the topmost point in hand contour
+        # (most likely to be the pointing finger tip)
+        pts = hand_contour[:, 0, :]
+        top_point = pts[pts[:, 1].argmin()]
+        return tuple(top_point)
+
+    def process(self, frame):
+        """
+        Expects a BGR frame already flipped (mirrored).
+        Updates self.tip_screen, self.hand_found, self.shoot_now.
+        Returns annotated frame for display.
+        """
+        self.shoot_now = False
+        h, w = frame.shape[:2]
+        self._frame_count += 1
+
+        # Get skin mask
+        skin_mask = self._skin_mask(frame)
+
+        # Get foreground (moving objects only - this isolates hand from static face)
+        fg = self._bgsub.apply(frame, learningRate=0.003)
+        fg = cv2.threshold(fg, 100, 255, cv2.THRESH_BINARY)[1]
+
+        # Combine: skin color AND motion = hand
+        hand_mask = cv2.bitwise_and(skin_mask, fg)
+
+        # Morphological cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        hand_mask = cv2.morphologyEx(hand_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        hand_mask = cv2.morphologyEx(hand_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        hand_mask = cv2.dilate(hand_mask, kernel, iterations=2)
+
+        # Find contours
+        cnts, _ = cv2.findContours(hand_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            self.hand_found = False
+            return frame
+
+        # Get largest contour = hand
+        hand = max(cnts, key=cv2.contourArea)
+        area = cv2.contourArea(hand)
+
+        # Filter: hand should be reasonably large (not noise)
+        if area < 3000 or area > 80000:
+            self.hand_found = False
+            return frame
+
+        self.hand_found = True
+
+        # Find fingertip
+        tip = self._find_fingertip(hand, h, w)
+        if tip is None:
+            self.hand_found = False
+            return frame
+
+        fx, fy = tip
+
+        # EMA smooth
+        alpha = EMA_ALPHA
+        if self._ema_x is None:
+            self._ema_x, self._ema_y = float(fx), float(fy)
+        else:
+            self._ema_x = alpha * fx + (1 - alpha) * self._ema_x
+            self._ema_y = alpha * fy + (1 - alpha) * self._ema_y
+
+        sx, sy = int(self._ema_x), int(self._ema_y)
+
+        # Clamp to frame bounds
+        sx = max(0, min(sx, w - 1))
+        sy = max(0, min(sy, h - 1))
+
+        # Map to game screen (frame already mirrored)
+        self.tip_screen = (
+            int(sx / w * WIN_W),
+            int(sy / h * WIN_H)
+        )
+
+        # Shoot detection: downward flick
+        self._y_history.append(sy)
+        now = time.time()
+        if len(self._y_history) >= 6:
+            recent_min = min(list(self._y_history)[-8:])
+            drop = sy - recent_min        # positive = moved down
+            if drop > SHOOT_DROP_PX:
+                if not self._shoot_armed and (now - self._last_shot) > SHOOT_COOLDOWN:
+                    self.shoot_now    = True
+                    self._shoot_armed = True
+                    self._last_shot   = now
+            else:
+                if drop < SHOOT_DROP_PX * 0.3:
+                    self._shoot_armed = False   # reset: finger back up → ready again
+
+        # Draw annotations on frame
+        # Draw hand contour
+        hull_pts = cv2.convexHull(hand)
+        cv2.drawContours(frame, [hull_pts], -1, (0, 200, 255), 2)
+
+        # Highlight fingertip
+        cv2.circle(frame, (sx, sy), 12, (0, 255, 0), -1)
+        cv2.circle(frame, (sx, sy), 16, (255, 255, 255), 2)
+        cv2.putText(frame, "TIP", (sx + 14, sy - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # Show shoot-armed state
+        if self._shoot_armed:
+            cv2.putText(frame, "READY", (sx + 14, sy + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 255), 2)
+
+        return frame
+    
