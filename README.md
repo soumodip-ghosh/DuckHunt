@@ -34,8 +34,28 @@ pip install -r requirements.txt
 
 ## Running the game
 
+You can run the game directly:
+
 ```bash
 python duck_hunt.py
+```
+
+Or use one of the provided launch scripts which will install `requirements.txt` (if needed) and start the game:
+
+- `start_game.bat` — Windows (double-click or run in CMD)
+- `start_game.ps1` — PowerShell
+- `start_game.sh` — Unix/macOS (make executable with `chmod +x start_game.sh`)
+
+Examples:
+
+```powershell
+start_game.bat
+# or
+./start_game.ps1
+```
+
+```bash
+./start_game.sh
 ```
 
 ## Controls and gestures
