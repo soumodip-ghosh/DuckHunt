@@ -380,4 +380,322 @@ class FingerTracker:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 255), 2)
 
         return frame
+
+# MAIN GAME CLASS
+# Initializes game, handles main loop, rendering, and integrates finger tracking and shooting mechanics.
+class DuckHuntGame:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((WIN_W, WIN_H))
+        pygame.display.set_caption("🎮 Duck Hunt — Finger Tracking")
+        self.clock = pygame.time.Clock()
+
+        self.font_lg  = pygame.font.SysFont("Arial", 56, bold=True)
+        self.font_md  = pygame.font.SysFont("Arial", 34, bold=True)
+        self.font_sm  = pygame.font.SysFont("Arial", 22)
+        self.font_xs  = pygame.font.SysFont("Arial", 18)
+        self.font_hit = pygame.font.SysFont("Arial", 30, bold=True)
+
+        # Open webcam at game resolution
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIN_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WIN_H)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+        self.tracker = FingerTracker()
+        self.reset()
     
+    # Reset game state for a new session
+    def reset(self):
+        self.score     = 0
+        self.misses    = 0
+        self.shots     = 0
+        self.hits      = 0
+        self.start_t   = time.time()
+        self.state     = "playing"
+        self.aim       = (WIN_W // 2, WIN_H // 2)
+        self.targeted  = None
+        self.ducks     = [Duck(i) for i in range(NUM_DUCKS)]
+        self.bullets   = []
+        self.particles = []
+        self.floats    = []
+        self._flash    = 0.0
+    
+    #HUD bar at the top showing score, time, and misses
+    def _draw_hud(self):
+        elapsed   = time.time() - self.start_t
+        remaining = max(0.0, GAME_DURATION - elapsed)
+
+        bar = pygame.Surface((WIN_W, 58), pygame.SRCALPHA)
+        bar.fill((0, 0, 0, 175))
+        self.screen.blit(bar, (0, 0))
+
+        # Score
+        sc = self.font_md.render(f"🦆  {self.score} pts", True, YELLOW)
+        self.screen.blit(sc, (18, 10))
+
+        # Lives (filled circles)
+        for i in range(MISS_LIMIT):
+            col = RED if i >= (MISS_LIMIT - self.misses) else (55, 55, 55)
+            pygame.draw.circle(self.screen, col,
+                               (WIN_W // 2 - MISS_LIMIT * 22 + i * 44, 28), 14)
+        lbl = self.font_xs.render("misses", True, GRAY)
+        self.screen.blit(lbl, (WIN_W // 2 - lbl.get_width() // 2, 46))
+
+        # Timer
+        tc = RED if remaining < 10 else WHITE
+        tt = self.font_md.render(f"⏱  {remaining:.1f}s", True, tc)
+        self.screen.blit(tt, (WIN_W - tt.get_width() - 18, 10))
+
+        # Accuracy (bottom left)
+        acc = int(self.hits / max(self.shots, 1) * 100)
+        at  = self.font_xs.render(
+            f"Accuracy {acc}%  ·  Shots {self.shots}  ·  Hits {self.hits}",
+            True, (210, 210, 210))
+        self.screen.blit(at, (18, WIN_H - 26))
+
+    # Draw crosshair at the aiming position
+    def _draw_crosshair(self, targeted):
+        ax, ay = int(self.aim[0]), int(self.aim[1])
+        col    = YELLOW if targeted else CYAN
+        t      = time.time()
+
+        # Outer ring
+        pygame.draw.circle(self.screen, col, (ax, ay), 32, 2)
+        # Centre dot
+        pygame.draw.circle(self.screen, col, (ax, ay), 6)
+        # Arms
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            pygame.draw.line(self.screen, col,
+                             (ax + dx * 10, ay + dy * 10),
+                             (ax + dx * 30, ay + dy * 30), 2)
+        # Pulsing lock ring
+        if targeted:
+            pulse = int(abs(math.sin(t * 8)) * 12)
+            s = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+            pygame.draw.circle(s, (255, 215, 0, 90),
+                               (ax, ay), AIM_RADIUS + pulse, 2)
+            self.screen.blit(s, (0, 0))
+    
+    #Shoot flash when firing a shot
+    def _shoot_flash(self, dt):
+        if self._flash > 0:
+            fl = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+            fl.fill((255, 255, 180, int(self._flash * 90)))
+            self.screen.blit(fl, (0, 0))
+            self._flash = max(0.0, self._flash - dt * 5)
+    
+    #Instructions screen
+    def _draw_instructions(self):
+        lines = [
+            "☝  Hold index finger UP  →  aim crosshair",
+            "↙  Flick finger DOWN     →  SHOOT",
+        ]
+        y = WIN_H - 68
+        for ln in lines:
+            s  = self.font_xs.render(ln, True, (235, 235, 235))
+            bg = pygame.Surface((s.get_width() + 16, s.get_height() + 6), pygame.SRCALPHA)
+            bg.fill((0, 0, 0, 140))
+            self.screen.blit(bg, (14, y))
+            self.screen.blit(s,  (22, y + 3))
+            y += s.get_height() + 6
+
+    #Hand status indicator
+    def _draw_hand_status(self):
+        found = self.tracker.hand_found
+        col   = GREEN if found else RED
+        txt   = "✋ Hand detected — aim & flick to shoot" if found \
+                else "✋ Show your index finger to the camera"
+        s  = self.font_xs.render(txt, True, col)
+        bg = pygame.Surface((s.get_width() + 16, s.get_height() + 6), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 150))
+        self.screen.blit(bg, (14, 62))
+        self.screen.blit(s,  (22, 65))
+
+    #Game over overlay
+    def _draw_gameover(self):
+        ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 185))
+        self.screen.blit(ov, (0, 0))
+
+        acc  = int(self.hits / max(self.shots, 1) * 100)
+        rows = [
+            ("GAME OVER",          self.font_lg, RED),
+            (f"Score: {self.score}", self.font_md, YELLOW),
+            (f"Ducks hit: {self.hits}", self.font_md, WHITE),
+            (f"Accuracy: {acc}%",  self.font_sm, CYAN),
+            ("",                   self.font_sm, WHITE),
+            ("Press  R  to Restart", self.font_md, GREEN),
+            ("Press  Q  to Quit",  self.font_sm, GRAY),
+        ]
+        total_h = sum(f.get_height() + 10 for _, f, _ in rows)
+        y = (WIN_H - total_h) // 2
+        for txt, font, col in rows:
+            s = font.render(txt, True, col)
+            s.set_alpha(235)
+            self.screen.blit(s, ((WIN_W - s.get_width()) // 2, y))
+            y += font.get_height() + 10
+    
+    # Convert OpenCV BGR frame to Pygame surface
+    @staticmethod
+    def _cv2pg(frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+    
+    # Main game loop
+    def run(self):
+        while True:
+            dt = self.clock.tick(FPS) / 1000.0
+
+            # Events handling
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    self._quit(); return
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key in (pygame.K_q, pygame.K_ESCAPE):
+                        self._quit(); return
+                    if ev.key == pygame.K_r and self.state == "gameover":
+                        self.reset()
+
+            # Webcam capture
+            ret, frame = self.cap.read()
+            cam_surf   = None
+            if ret:
+                frame    = cv2.flip(frame, 1)                 # mirror
+                frame    = cv2.resize(frame, (WIN_W, WIN_H))  # fill window
+                frame    = self.tracker.process(frame)        # track & annotate
+                cam_surf = self._cv2pg(frame)
+
+            # Update aim from tracker
+            if self.tracker.hand_found and self.tracker.tip_screen:
+                self.aim = self.tracker.tip_screen
+
+            # Game logic 
+            if self.state == "playing":
+                elapsed = time.time() - self.start_t
+                if elapsed >= GAME_DURATION:
+                    self.state = "gameover"
+
+                # Replenish ducks
+                alive = [d for d in self.ducks if d.alive]
+                while len(alive) < NUM_DUCKS:
+                    self.ducks.append(Duck())
+                    alive = [d for d in self.ducks if d.alive]
+
+                # Find targeted duck
+                self.targeted = None
+                best = AIM_RADIUS
+                for d in self.ducks:
+                    if not d.alive: continue
+                    dc   = d.center()
+                    dist = math.hypot(self.aim[0] - dc[0], self.aim[1] - dc[1])
+                    if dist < best:
+                        best = dist
+                        self.targeted = d
+
+                # Shoot
+                if self.tracker.shoot_now:
+                    self.shots  += 1
+                    self._flash  = 1.0
+                    bx, by = self.aim
+                    if self.targeted:
+                        dc = self.targeted.center()
+                        vx, vy = dc[0] - bx, dc[1] - by
+                    else:
+                        self.misses += 1
+                        vx, vy = 0, -1
+                        self.floats.append(
+                            FloatText("MISS!", bx, by - 40, RED, self.font_hit))
+                        if self.misses >= MISS_LIMIT:
+                            self.state = "gameover"
+                    self.bullets.append(Bullet(bx, by, vx, vy))
+
+                # Update & collision
+                for b in self.bullets: b.update()
+                for b in self.bullets:
+                    if not b.alive: continue
+                    for d in self.ducks:
+                        if not d.alive: continue
+                        if d.rect().collidepoint(b.x, b.y):
+                            b.alive = False
+                            d.alive = False
+                            self.score += POINTS_HIT
+                            self.hits  += 1
+                            dc = d.center()
+                            for _ in range(26):
+                                self.particles.append(Particle(dc[0], dc[1], d.body_col))
+                            for _ in range(12):
+                                self.particles.append(Particle(dc[0], dc[1], YELLOW))
+                            self.floats.append(
+                                FloatText(f"+{POINTS_HIT}", dc[0], dc[1]-38,
+                                          YELLOW, self.font_hit))
+                            break
+                self.bullets = [b for b in self.bullets if b.alive]
+
+                for d in self.ducks: d.update(dt)
+                for p in self.particles: p.update(dt)
+                self.particles = [p for p in self.particles if p.life > 0]
+                for f in self.floats: f.update(dt)
+                self.floats = [f for f in self.floats if f.life > 0]
+
+            # Render 
+            self.screen.fill(BLACK)
+
+            # 1. Webcam feed = entire background (you + room visible)
+            if cam_surf:
+                self.screen.blit(cam_surf, (0, 0))
+            else:
+                self.screen.fill((25, 25, 35))
+
+            # 2. Light vignette so ducks stand out
+            vig = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+            vig.fill((0, 0, 0, 50))
+            self.screen.blit(vig, (0, 0))
+
+            # 3. Ducks
+            for d in self.ducks:
+                d.draw(self.screen, d is self.targeted)
+
+            # 4. Bullets
+            for b in self.bullets:
+                b.draw(self.screen)
+
+            # 5. Particles
+            for p in self.particles:
+                p.draw(self.screen)
+
+            # 6. Floating texts
+            for f in self.floats:
+                f.draw(self.screen)
+
+            # 7. Shoot flash
+            self._shoot_flash(dt)
+
+            # 8. Crosshair
+            if self.state == "playing":
+                if self.tracker.hand_found:
+                    self._draw_crosshair(self.targeted is not None)
+                else:
+                    ax, ay = int(self.aim[0]), int(self.aim[1])
+                    pygame.draw.circle(self.screen, GRAY, (ax, ay), 32, 2)
+                    pygame.draw.circle(self.screen, GRAY, (ax, ay),  6)
+
+            # 9. HUD (top bar)
+            self._draw_hud()
+
+            # 10. Hand status
+            self._draw_hand_status()
+
+            # 11. Instructions
+            if self.state == "playing":
+                self._draw_instructions()
+
+            # 12. Game over overlay
+            if self.state == "gameover":
+                self._draw_gameover()
+
+            pygame.display.flip()
+
+    def _quit(self):
+        self.cap.release()
+        pygame.quit()
