@@ -1,0 +1,4 @@
+# Requirements for Duck Hunt
+opencv-python
+pygame
+numpy
